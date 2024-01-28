@@ -29,6 +29,8 @@ func NewGobCodec(conn io.ReadWriteCloser) Codec {
 func (c *GobCodec) ReadHeader(h *Header) error {
 	return c.dec.Decode(h)
 }
+
+// ReadBody 调用cc的解码方式解码body
 func (c *GobCodec) ReadBody(body interface{}) error {
 	return c.dec.Decode(body)
 }
