@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"gee_RPC/codec"
+	"gee_RPC/service"
 	"io"
 	"log"
 	"net"
 	"reflect"
+	"strings"
 	"sync"
 )
 
@@ -25,7 +27,39 @@ var DefaultOption = &Option{
 }
 
 // Server 服务端的实现
-type Server struct{}
+type Server struct {
+	serviceMap sync.Map
+}
+
+func (server *Server) Register(rcvr interface{}) error {
+	s := service.NewService(rcvr)
+	if _, dup := server.serviceMap.LoadOrStore(s.Name, s); dup {
+		return errors.New("rpc: service already defined: " + s.Name)
+	}
+	return nil
+}
+
+func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
+
+func (server *Server) findService(serviceMethod string) (svc *service.Service, mtype *service.MethodType, err error) {
+	dot := strings.LastIndex(serviceMethod, ".")
+	if dot < 0 {
+		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
+		return
+	}
+	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
+	svci, ok := server.serviceMap.Load(serviceName)
+	if !ok {
+		err = errors.New("rpc server: can't find service " + serviceName)
+		return
+	}
+	svc = svci.(*service.Service)
+	mtype = svc.Method[methodName]
+	if mtype == nil {
+		err = errors.New("rpc server: can't find method " + methodName)
+	}
+	return
+}
 
 func NewServer() *Server {
 	return &Server{}
@@ -33,18 +67,18 @@ func NewServer() *Server {
 
 var DefaultServer = NewServer()
 
-func (s *Server) Accept(listen net.Listener) {
+func (server *Server) Accept(listen net.Listener) {
 	for {
 		conn, err := listen.Accept()
 		if err != nil {
 			log.Println("rpc server: accept error:", err)
 			return
 		}
-		go s.ServerConn(conn)
+		go server.ServerConn(conn)
 	}
 }
 
-func (s *Server) ServerConn(conn net.Conn) {
+func (server *Server) ServerConn(conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
 	}()
@@ -60,30 +94,30 @@ func (s *Server) ServerConn(conn net.Conn) {
 	//f是用于处理对应编码类型的函数
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
-		log.Printf("rpc server: invalid codec type %s", opt.CodecType)
+		log.Printf("rpc server: invalid codec type %server", opt.CodecType)
 		return
 	}
 	//将连接conn交由对应的编码函数处理,获得实现了Codec接口的对象cc,将cc交给serverCodec进一步处理
-	s.serverCodec(f(conn))
+	server.serverCodec(f(conn))
 }
 
 var invalidReq = struct{}{}
 
-func (s *Server) serverCodec(cc codec.Codec) {
+func (server *Server) serverCodec(cc codec.Codec) {
 	sending := new(sync.Mutex)
 	wg := new(sync.WaitGroup)
 	for {
-		req, err := s.readRequest(cc)
+		req, err := server.readRequest(cc)
 		if err != nil {
 			if req == nil {
 				break
 			}
 			req.h.Err = err
-			s.sendResponse(cc, req.h, invalidReq, sending)
+			server.sendResponse(cc, req.h, invalidReq, sending)
 			continue
 		}
 		wg.Add(1)
-		go s.handleRequest(cc, req, sending, wg)
+		go server.handleRequest(cc, req, sending, wg)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -92,9 +126,11 @@ func (s *Server) serverCodec(cc codec.Codec) {
 type request struct {
 	h            *codec.Header // header of request
 	args, replyv reflect.Value
+	mtype        *service.MethodType
+	svc          *service.Service
 }
 
-func (s *Server) readRequestHeader(cc codec.Codec) (header *codec.Header, err error) {
+func (server *Server) readRequestHeader(cc codec.Codec) (header *codec.Header, err error) {
 	var h codec.Header
 	if err = cc.ReadHeader(&h); err != nil {
 		if err != io.EOF && !errors.Is(err, io.ErrUnexpectedEOF) {
@@ -105,20 +141,30 @@ func (s *Server) readRequestHeader(cc codec.Codec) (header *codec.Header, err er
 	return &h, nil
 }
 
-func (s *Server) readRequest(cc codec.Codec) (*request, error) {
-	h, err := s.readRequestHeader(cc)
+func (server *Server) readRequest(cc codec.Codec) (*request, error) {
+	h, err := server.readRequestHeader(cc)
 	if err != nil {
 		return nil, err
 	}
 	req := &request{h: h}
-	req.args = reflect.New(reflect.TypeOf(""))
-	if err = cc.ReadBody(req.args.Interface()); err != nil {
+	req.svc, req.mtype, err = server.findService(h.ServiceMethod)
+	if err != nil {
+		return req, err
+	}
+	req.args = req.mtype.NewArgv()
+	req.replyv = req.mtype.NewReplyv()
+
+	argvi := req.args.Interface()
+	if req.args.Type().Kind() != reflect.Ptr {
+		argvi = req.args.Addr().Interface()
+	}
+	if err = cc.ReadBody(argvi); err != nil {
 		log.Println("rpc server: read body error:", err)
 	}
 	return req, nil
 }
 
-func (s *Server) sendResponse(cc codec.Codec, header *codec.Header, body interface{}, sending *sync.Mutex) {
+func (server *Server) sendResponse(cc codec.Codec, header *codec.Header, body interface{}, sending *sync.Mutex) {
 	sending.Lock()
 	defer sending.Unlock()
 	if err := cc.Write(header, body); err != nil {
@@ -126,12 +172,16 @@ func (s *Server) sendResponse(cc codec.Codec, header *codec.Header, body interfa
 	}
 }
 
-func (s *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
+func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.Mutex, wg *sync.WaitGroup) {
 	defer wg.Done()
-	log.Println("rpc server: receive request:", req.h, req.args.Elem())
 	fmt.Println()
-	req.replyv = reflect.ValueOf(fmt.Sprintf("gee rpv resp : %d", req.h.Seq))
-	s.sendResponse(cc, req.h, req.replyv.Interface(), sending)
+	err := req.svc.Call(req.mtype, req.args, req.replyv)
+	if err != nil {
+		req.h.Err = err
+		server.sendResponse(cc, req.h, invalidReq, sending)
+		return
+	}
+	server.sendResponse(cc, req.h, req.replyv.Interface(), sending)
 }
 
 func Accept(listen net.Listener) { DefaultServer.Accept(listen) }

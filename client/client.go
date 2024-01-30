@@ -14,7 +14,7 @@ import (
 // Call 既可以代表客户端要发送的请求，也可以代表客户端接收到的响应
 // 发送请求是给服务端发送一个Call对象，接收响应是从服务端接收一个Call对象
 type Call struct {
-	Seq           uint
+	Seq           uint64
 	ServiceMethod string      // format "Service.Method"
 	Args          interface{} // arguments to the function
 	Reply         interface{} // reply from the function
@@ -32,8 +32,8 @@ type Client struct {
 	sending  sync.Mutex
 	header   codec.Header
 	mu       sync.Mutex
-	seq      uint
-	pending  map[uint]*Call
+	seq      uint64
+	pending  map[uint64]*Call
 	closing  bool
 	shutdown bool
 }
@@ -59,7 +59,7 @@ func (client *Client) IsAvailable() bool {
 }
 
 // registerCall 把call注册到client.pending中，为了防止并发注册，使用了client.mu锁
-func (client *Client) registerCall(call *Call) (uint, error) {
+func (client *Client) registerCall(call *Call) (uint64, error) {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	if client.closing || client.shutdown {
@@ -73,7 +73,7 @@ func (client *Client) registerCall(call *Call) (uint, error) {
 
 // removeCall 从client.pending中删除call，为了防止并发删除，使用了client.mu锁
 // 客户端向服务端发送一个请求,返回的响应的seq和发送的请求的seq是相同的
-func (client *Client) removeCall(seq uint) *Call {
+func (client *Client) removeCall(seq uint64) *Call {
 	client.mu.Lock()
 	defer client.mu.Unlock()
 	call := client.pending[seq]
@@ -141,7 +141,7 @@ func newClientCodec(cc codec.Codec, opt *server.Option) *Client {
 		seq:     1,
 		cc:      cc,
 		opt:     opt,
-		pending: make(map[uint]*Call),
+		pending: make(map[uint64]*Call),
 	}
 	go client.receive()
 	return client
